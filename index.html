@@ -7,6 +7,9 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@600;700&family=Josefin+Sans:wght@300;400;600&family=Nunito:ital,wght@0,400;0,600;0,700;1,400&family=M+PLUS+Rounded+1c:wght@800&display=swap" rel="stylesheet">
+<!-- Firebase SDK (compat) -->
+<script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
 <style>
 /* ── CSS Variables ───────────────────────────────────────────── */
 :root {
@@ -852,6 +855,7 @@ textarea { resize: vertical; min-height: 56px; }
     <span class="title-ja">ざっくり</span><span class="title-en">TASK</span>
   </h1>
   <div class="header-actions">
+    <span id="syncStatus" style="font-size:1.2rem;display:none;cursor:default;padding:0 4px" title=""></span>
     <button class="btn-icon" id="copyUrlBtn" title="URLをコピー">🔗</button>
     <button class="btn-icon" id="langBtn">EN</button>
     <button class="btn-icon" id="settingsBtn">⚙️</button>
@@ -1010,6 +1014,94 @@ let selectedTaskId = null;
 let dpMonth = new Date();
 let _dpCallback = null; // callback-based date picker
 
+// ── Firebase config ────────────────────────────────────────────
+// TODO: Replace with your Firebase project config
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyBS9WJuXrRXq-rfl_szeR2Ko356BoK0c2M",
+  authDomain: "rough-task-7e75b.firebaseapp.com",
+  databaseURL: "https://rough-task-7e75b-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "rough-task-7e75b",
+  storageBucket: "rough-task-7e75b.firebasestorage.app",
+  messagingSenderId: "510486813191",
+  appId: "1:510486813191:web:b9a0271834ba12d90828a2"
+};
+
+let _fbDb = null;
+let _fbEnabled = false;
+
+function initFirebase() {
+  if (!FIREBASE_CONFIG.databaseURL) return;
+  try {
+    if (!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
+    _fbDb = firebase.database();
+    _fbEnabled = true;
+    setSyncStatus('ok');
+  } catch(e) {
+    console.warn('Firebase init failed:', e);
+  }
+}
+
+function fbPath() {
+  const pid = localStorage.getItem('personalId');
+  return pid ? `rooms/${pid}/tasks` : null;
+}
+
+function setSyncStatus(state) {
+  const el = document.getElementById('syncStatus');
+  if (!el) return;
+  if (state === 'syncing') { el.textContent = '🔄'; el.title = '同期中...'; el.style.display = ''; }
+  else if (state === 'ok') { el.textContent = '☁️'; el.title = '同期済み';  el.style.display = ''; }
+  else if (state === 'err'){ el.textContent = '⚠️'; el.title = '同期エラー';el.style.display = ''; }
+  else                     { el.style.display = 'none'; }
+}
+
+function saveToFirebase() {
+  if (!_fbEnabled) return;
+  const path = fbPath();
+  if (!path) return;
+  setSyncStatus('syncing');
+  _fbDb.ref(path).set(tasks)
+    .then(() => setSyncStatus('ok'))
+    .catch(() => setSyncStatus('err'));
+}
+
+function startRealtimeListener() {
+  if (!_fbEnabled) return;
+  const path = fbPath();
+  if (!path) return;
+  _fbDb.ref(path).on('value', snap => {
+    const data = snap.val();
+    if (data && Array.isArray(data)) {
+      tasks = data;
+      localStorage.setItem('tasks', JSON.stringify(tasks));
+      renderAll();
+    }
+    setSyncStatus('ok');
+  }, () => setSyncStatus('err'));
+}
+
+async function loadFromFirebase() {
+  if (!_fbEnabled) return false;
+  const path = fbPath();
+  if (!path) return false;
+  try {
+    setSyncStatus('syncing');
+    const snap = await _fbDb.ref(path).once('value');
+    const data = snap.val();
+    if (data && Array.isArray(data)) {
+      tasks = data;
+      localStorage.setItem('tasks', JSON.stringify(tasks));
+      setSyncStatus('ok');
+      return true;
+    }
+    setSyncStatus('ok');
+    return false;
+  } catch(e) {
+    setSyncStatus('err');
+    return false;
+  }
+}
+
 // ── URL encode / decode ────────────────────────────────────────
 function encodeTasks(arr) {
   try { return btoa(encodeURIComponent(JSON.stringify(arr))); } catch(e) { return ''; }
@@ -1024,9 +1116,13 @@ function genPersonalId() {
 }
 
 function updateURLHash() {
+  const pid = localStorage.getItem('personalId');
+  if (_fbEnabled) {
+    // Firebase mode: URL always shows personal ID only
+    if (pid) history.replaceState(null, '', '#' + pid);
+    return;
+  }
   if (tasks.length === 0) {
-    // タスクが空になったら個人IDに戻す
-    const pid = localStorage.getItem('personalId');
     if (pid) history.replaceState(null, '', '#' + pid);
     return;
   }
@@ -1034,10 +1130,43 @@ function updateURLHash() {
   if (encoded) history.replaceState(null, '', '#' + encoded);
 }
 
-function loadInitialTasks() {
+async function loadInitialTasks() {
   const hash = location.hash.slice(1);
 
-  // p_ で始まるハッシュは個人ID（タスクなし状態の識別子）
+  // 個人IDを確保（Firebase・非Firebase共通）
+  if (hash && hash.startsWith('p_')) {
+    localStorage.setItem('personalId', hash);
+  } else if (!hash) {
+    const pid = localStorage.getItem('personalId') || genPersonalId();
+    localStorage.setItem('personalId', pid);
+    history.replaceState(null, '', '#' + pid);
+  }
+
+  // Firebase初期化を試みる
+  initFirebase();
+
+  if (_fbEnabled) {
+    const loaded = await loadFromFirebase();
+    if (!loaded) {
+      // Firebaseにデータなし → URLやlocalStorageから移行
+      if (hash && !hash.startsWith('p_')) {
+        const decoded = decodeTasks(hash);
+        if (decoded !== null) {
+          tasks = decoded;
+          localStorage.setItem('tasks', JSON.stringify(tasks));
+          saveToFirebase();
+          history.replaceState(null, '', '#' + localStorage.getItem('personalId'));
+        }
+      } else {
+        tasks = JSON.parse(localStorage.getItem('tasks') || '[]');
+        if (tasks.length > 0) saveToFirebase();
+      }
+    }
+    startRealtimeListener();
+    return;
+  }
+
+  // 非Firebaseモード：URLエンコード方式
   if (hash && !hash.startsWith('p_')) {
     const decoded = decodeTasks(hash);
     if (decoded !== null) {
@@ -1047,24 +1176,8 @@ function loadInitialTasks() {
     }
   }
 
-  // localStorageからタスクを復元
   tasks = JSON.parse(localStorage.getItem('tasks') || '[]');
-
-  if (tasks.length > 0) {
-    // タスクがあればURLに反映
-    updateURLHash();
-  } else {
-    // タスクなし → 個人IDを確保
-    if (hash && hash.startsWith('p_')) {
-      // 既存の個人IDページにアクセスした → 保存
-      localStorage.setItem('personalId', hash);
-    } else if (!hash) {
-      // 初回アクセス：新しい個人IDを生成してURLに付与
-      const pid = localStorage.getItem('personalId') || genPersonalId();
-      localStorage.setItem('personalId', pid);
-      history.replaceState(null, '', '#' + pid);
-    }
-  }
+  if (tasks.length > 0) updateURLHash();
 }
 
 // ── i18n ───────────────────────────────────────────────────────
@@ -1660,6 +1773,7 @@ function updateNotifStatus() {
 function saveTasks() {
   localStorage.setItem('tasks', JSON.stringify(tasks));
   updateURLHash();
+  if (_fbEnabled) saveToFirebase();
   renderURLInfoCard();
 }
 
@@ -1858,9 +1972,10 @@ function renderAll() {
   checkNotifications();
 }
 
-loadInitialTasks();
-applyLang();
-renderAll();
+loadInitialTasks().then(() => {
+  applyLang();
+  renderAll();
+});
 </script>
 </body>
 </html>
